@@ -1,0 +1,36 @@
+# Generated source and image-build inputs
+/build/
+
+# Runtime evidence and local configuration
+/evidence/
+/.env
+/*.env
+!/config/server.env.example
+
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*~
+
+# Never vendor model weights or common checkpoint formats
+*.bin
+*.gguf
+*.safetensors
+*.safetensors.index.json
+*.pt
+*.pth
+
+# Logs, credentials, and key material
+*.log
+*.pem
+*.key
+credentials*
+secrets*

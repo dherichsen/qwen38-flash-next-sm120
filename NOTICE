@@ -1,0 +1,17 @@
+Qwen3.8 Flash-Next SM120 deployment kit
+Copyright 2026 David Erichsen
+
+This project composes and deploys software from SGLang, which is licensed
+under the Apache License 2.0. The repository does not redistribute SGLang as a
+source tree; the pinned patches under patches/ retain their original authorship
+and are applied to a pinned upstream SGLang commit.
+
+Patch attribution:
+
+* "Collect before profiling available memory for the KV cache budget"
+  by Alison Shao. Upstream SGLang pull request #36583.
+* "fix(qsa): support FP8 KV cache" by LING ZHI. Upstream SGLang pull
+  request #36644.
+
+Qwen and Qwen3.8 model weights are not part of this Apache-licensed project.
+They are governed by the Qwen Community License 1.0. See docs/licensing.md.

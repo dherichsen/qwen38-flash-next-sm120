@@ -1,0 +1,11 @@
+* text=auto eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.env text eol=lf
+*.in text eol=lf
+
+# Git format-patch intentionally contains whitespace-only context lines and the
+# conventional "-- " signature separator. Preserve those bytes because their
+# SHA-256 values are part of the source-composition contract.
+patches/*.patch -whitespace

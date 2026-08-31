@@ -1,0 +1,33 @@
+[Unit]
+Description=Qwen3.8 Flash-Next SGLang worker on one SM120 GPU
+Documentation=https://github.com/dherichsen/qwen38-flash-next-sm120
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=1800
+StartLimitBurst=2
+
+[Service]
+Type=exec
+User=root
+Group=root
+EnvironmentFile=/etc/qwen38-flash-next.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+StateDirectory=qwen38-flash-next
+StateDirectoryMode=0700
+RuntimeDirectory=qwen38-flash-next
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStartPre=/usr/bin/install -d -o root -g root -m 0700 ${QWEN38_KERNEL_CACHE}
+ExecStartPre=/usr/bin/python3 @INSTALL_DIR@/scripts/preflight.py
+ExecStart=/usr/bin/python3 @INSTALL_DIR@/scripts/run.py --execute
+ExecStartPost=/usr/bin/python3 @INSTALL_DIR@/scripts/ready.py
+ExecStop=-/usr/bin/docker stop --time 120 ${QWEN38_CONTAINER_NAME}
+Restart=on-failure
+RestartSec=60
+TimeoutStartSec=1800
+TimeoutStopSec=180
+SuccessExitStatus=143
+
+[Install]
+WantedBy=multi-user.target
