@@ -31,6 +31,23 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertNotIn("--privileged", argv)
         self.assertIn("no-new-privileges", argv)
 
+    def test_nvidia_profile_matches_recorded_production_server_arguments(self) -> None:
+        import json
+        env = self.base_env() | {"QWEN38_PROFILE": "nvidia-200k", "QWEN38_CONTEXT_LENGTH": "200000", "QWEN38_MAX_TOTAL_TOKENS": "200000"}
+        config = RuntimeConfig.from_env(env)
+        argv = config.docker_argv()
+        actual = argv[argv.index("python3"):]
+        recorded = json.loads((SCRIPTS.parent / "config/nvidia-server-argv.json").read_text())
+        # JSON key order has no effect on template behavior; all other args exact.
+        for args in (actual, recorded):
+            i = args.index("--default-chat-template-kwargs") + 1
+            args[i] = json.dumps(json.loads(args[i]), sort_keys=True)
+        self.assertEqual(actual, recorded)
+
+    def test_unknown_profile_refused(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "unknown"):
+            RuntimeConfig.from_env(self.base_env() | {"QWEN38_PROFILE": "typo"})
+
     def test_execution_is_one_gpu_only(self) -> None:
         env = self.base_env() | {"QWEN38_GPU_DEVICE": "0,1"}
         with self.assertRaisesRegex(ConfigError, "exactly one GPU"):

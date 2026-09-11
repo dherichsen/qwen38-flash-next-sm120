@@ -1,5 +1,8 @@
 # Qwen3.8 Flash-Next on one SM120 GPU
 
+**Current setup:** [200K technical field guide](https://dherichsen.github.io/qwen38-flash-next-sm120/) · [source guide](docs/current-setup.md). The September 7 deployment uses the public NVIDIA checkpoint and the compatibility overlay now included here. The original August 31 profile and results below remain historical.
+
+
 This repository captures a reproducible SGLang source composition and a
 single-GPU deployment profile for Qwen3.8 Flash-Next on an NVIDIA RTX PRO
 6000 Blackwell (SM120, 96 GiB). It preserves reasoning, tool calling, 131,072
@@ -158,3 +161,13 @@ Repository-authored code is Apache-2.0. Vendored patches remain attributed to
 their SGLang authors under Apache-2.0. Model weights are not included and are
 subject to separate terms. See [LICENSE](LICENSE), [NOTICE](NOTICE), and
 [docs/licensing.md](docs/licensing.md).
+
+## Maintaining the public field guide
+
+Edit `docs/current-setup.md`, then render the static site with:
+
+```bash
+uv run --with markdown-it-py==4.0.0 python scripts/build_guide.py
+```
+
+GitHub Pages serves the committed `docs/` directory with Jekyll disabled. The guide uses local assets, no analytics and no live inference connection. `scripts/verify_guide.py` checks desktop/mobile navigation, command copying and public assets using Playwright. The production worker is managed separately; publishing documentation does not restart it.

@@ -1,0 +1,13 @@
+# syntax=docker/dockerfile:1.7
+ARG QWEN38_BASE_IMAGE=qwen38-flash-next-sm120:2026-08-31
+FROM ${QWEN38_BASE_IMAGE}
+ARG NVIDIA_PATCH_SHA256
+COPY patches/0003-nvidia-mixed-host-offload.patch /tmp/nvidia-overlay.patch
+COPY config/nvidia-source-manifest.json /tmp/nvidia-manifest.json
+COPY scripts/apply_nvidia_overlay.py /tmp/apply_nvidia_overlay.py
+RUN test -n "$NVIDIA_PATCH_SHA256" && \
+    echo "$NVIDIA_PATCH_SHA256  /tmp/nvidia-overlay.patch" | sha256sum --check --strict && \
+    python3 /tmp/apply_nvidia_overlay.py --root /sgl-workspace/sglang --patch /tmp/nvidia-overlay.patch --manifest /tmp/nvidia-manifest.json && \
+    python3 -m compileall -q /sgl-workspace/sglang/python/sglang && \
+    rm /tmp/nvidia-overlay.patch /tmp/nvidia-manifest.json /tmp/apply_nvidia_overlay.py
+LABEL ai.qwen38.profile="nvidia-200k" ai.qwen38.nvidia.patch-sha256="${NVIDIA_PATCH_SHA256}"

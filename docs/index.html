@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Qwen3.8 on one Blackwell GPU — 200K field guide</title>
+<meta name="description" content="Reproduce a local Qwen3.8 Flash-Next NVFP4 deployment: RTX PRO 6000 Blackwell, 200K context, SGLang, verified compatibility patches and practical installation steps.">
+<link rel="stylesheet" href="assets/guide.css"><script src="assets/guide.js" defer></script></head>
+<body><a class="skip" href="#guide">Skip to guide</a>
+<header class="top"><a href="./" class="wordmark">LOCAL COMPUTE / FIELD NOTES</a><a href="https://github.com/dherichsen/qwen38-flash-next-sm120">Source on GitHub ↗</a></header>
+<div class="layout"><aside><p class="eyebrow">FIELD GUIDE 01</p><nav aria-label="Contents"><a href="#is-the-original-repository-still-used"><span>01</span>Is the original repository still used?</a><a href="#hardware-and-operating-envelope"><span>02</span>Hardware and operating envelope</a><a href="#1-prepare-the-host-and-download-the-checkpoint"><span>03</span>1. Prepare the host and download the checkpoint</a><a href="#2-build-the-original-foundation-and-current-overlay"><span>04</span>2. Build the original foundation and current overlay</a><a href="#3-configure-one-gpu-and-inspect-the-launch"><span>05</span>3. Configure one GPU and inspect the launch</a><a href="#4-verify-readiness-in-a-second-terminal"><span>06</span>4. Verify readiness in a second terminal</a><a href="#5-connect-a-client"><span>07</span>5. Connect a client</a><a href="#evidence-and-limits"><span>08</span>Evidence and limits</a></nav><div class="edition">Recorded 11 September 2026<br>Linux · SM120 · single GPU</div></aside>
+<main id="guide"><header class="hero"><p class="eyebrow">QWEN3.8 FLASH-NEXT / NVIDIA NVFP4</p><h1>A local model.<br>A reproducible setup.</h1><p class="lede">The 200K configuration running on one RTX PRO 6000 Blackwell. From the original source tree to your first verified response.</p><a class="start" href="#1-prepare-the-host-and-download-the-checkpoint">Start the installation <span aria-hidden="true">↓</span></a><a class="secondary" href="current-setup.md">Read as Markdown ↗</a>
+<div class="architecture" aria-label="Request path"><div><small>YOUR CLIENT</small><strong>Chat + tools</strong><span>Medium thinking · one request</span></div><b aria-hidden="true">→</b><div><small>LOCAL RUNTIME</small><strong>SGLang / 200K</strong><span>FP8 KV · NEXTN decoding</span></div><b aria-hidden="true">→</b><div><small>HARDWARE</small><strong>96 GB Blackwell</strong><span>Embeddings offloaded to RAM</span></div></div>
+<p class="boundary">A documented working setup, with source and configuration checks. Run acceptance on your own hardware before relying on it.</p></header>
+<article><h2 id="is-the-original-repository-still-used">Is the original repository still used?</h2>
+<p>Yes, as the source foundation. Production runs a separately built image based on the same SGLang tree <code>7848e2094b30690a40a47a56f1e8f4e68a9929d3</code>, plus the NVIDIA compatibility overlay now included here. It does not execute this Git checkout directly. The original August 31 configuration remains available; merely raising its context limit does not reproduce the new deployment.</p>
+<div class="table-wrap" role="region" aria-label="Configuration comparison" tabindex="0"><table>
+<thead>
+<tr>
+<th>Component</th>
+<th>August 31 profile</th>
+<th>Current September 7 deployment</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Checkpoint</td>
+<td>Earlier RadixArk candidate</td>
+<td>NVIDIA Qwen3.8-Flash-Next-NVFP4</td>
+</tr>
+<tr>
+<td>Context / shared token pool</td>
+<td>131,072 / 131,072</td>
+<td>200,000 / 200,000</td>
+</tr>
+<tr>
+<td>Quantization loader</td>
+<td><code>modelopt_fp4</code></td>
+<td><code>modelopt_mixed</code></td>
+</tr>
+<tr>
+<td>Offload</td>
+<td>PLE embeddings</td>
+<td>PLE + vocabulary embeddings to host</td>
+</tr>
+<tr>
+<td>Runtime</td>
+<td>Pinned SGLang + GC / FP8 KV patches</td>
+<td>Same foundation + NVIDIA compatibility patches</td>
+</tr>
+<tr>
+<td>Unchanged</td>
+<td>Single GPU, FP8 E4M3 KV, NEXTN</td>
+<td>Single GPU, FP8 E4M3 KV, NEXTN</td>
+</tr>
+</tbody>
+</table></div>
+<p>The <a href="https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4">NVIDIA checkpoint</a> is public. This guide pins revision <code>fc694b54fb0174e0913e6adf86691ef85a4ead47</code>. Obtain the weights from the publisher; no weights are redistributed here. Review the model card’s linked NVIDIA and Qwen terms.</p>
+<h2 id="hardware-and-operating-envelope">Hardware and operating envelope</h2>
+<ul>
+<li>Linux x86-64; NVIDIA RTX PRO 6000 <strong>Blackwell</strong> with 96 GB. An older RTX 6000 is a different architecture. This full profile does not fit the 32 GB RTX 5090; the second GPU in our machine is reserved for separate research.</li>
+<li>Our host has 192 GB-class RAM (186 GiB reported by Linux). Offloaded embeddings and checkpoint loading require substantial host memory. This is an observed working configuration, not a measured minimum.</li>
+<li>Fast local storage: roughly 123.6 GiB for checkpoint shards, plus the model cache, approximately 47 GB container image and build workspace. Allow ample additional space for downloads and intermediate layers.</li>
+<li>Observed driver: 595.84. The container toolchain is digest-pinned in <code>config/pins.env</code>; host driver/container compatibility must be checked on your machine.</li>
+<li>One generation at a time; CPUs 0–31 on our host. Change CPU affinity to valid CPUs on yours. Cold startup took approximately nine minutes in the deployment record.</li>
+<li>About 87 GiB GPU memory was in use during the September 11 spot check; this is not a peak bound or a guarantee for every request.</li>
+<li>Default client profile: medium preserved thinking, temperature 0, up to 32,768 output tokens per request. Input, history, reasoning and output share the 200,000-token context. The output allowance is a client setting, not a server-wide cap.</li>
+</ul>
+<h2 id="1-prepare-the-host-and-download-the-checkpoint">1. Prepare the host and download the checkpoint</h2>
+<p>Install Docker, NVIDIA Container Toolkit, Git, Python 3 and <code>uv</code>. Confirm Docker GPU access before proceeding. Use the <a href="https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html">NVIDIA Container Toolkit installation guide</a> for your distribution.</p>
+<pre><code class="language-bash">nvidia-smi --query-gpu=uuid,name,memory.total,compute_cap --format=csv
+lscpu
+
+git clone https://github.com/dherichsen/qwen38-flash-next-sm120.git
+cd qwen38-flash-next-sm120
+
+uv tool install huggingface_hub
+mkdir -p &quot;$HOME/models/qwen38-flash-next-nvfp4&quot;
+hf download nvidia/Qwen3.8-Flash-Next-NVFP4 \
+  --revision fc694b54fb0174e0913e6adf86691ef85a4ead47 \
+  --local-dir &quot;$HOME/models/qwen38-flash-next-nvfp4&quot;
+</code></pre>
+<p>Allow Hugging Face’s default Xet transfer support; disabling it broke the large-file download in our preparation. If authentication is required, use <code>hf auth login</code> locally. Never put tokens in this repository. The download is large; do not point the runtime at a partially downloaded directory.</p>
+<h2 id="2-build-the-original-foundation-and-current-overlay">2. Build the original foundation and current overlay</h2>
+<pre><code class="language-bash">./scripts/compose_sglang_source.sh
+./scripts/build_image.sh
+./scripts/build_nvidia_image.sh
+python3 -m unittest discover -s tests -v
+</code></pre>
+<p>The first stage reconstructs the pinned public SGLang tree. The second image adds <code>patches/0003-nvidia-mixed-host-offload.patch</code>, checking every changed file before and after application. It includes mixed ModelOpt loading, SM120 FP4/FP8 backend compatibility, routing fixes and host embedding offload. See <a href="https://github.com/dherichsen/qwen38-flash-next-sm120/blob/main/patches/PROVENANCE.md">patch provenance</a> and <a href="https://github.com/dherichsen/qwen38-flash-next-sm120/blob/main/config/nvidia-source-manifest.json">source hashes</a>.</p>
+<p>Image builds use CPU and disk; they do not load the model. Image IDs will differ from our original production image because the layer history differs. A local image ID is not a downloadable registry reference.</p>
+<h2 id="3-configure-one-gpu-and-inspect-the-launch">3. Configure one GPU and inspect the launch</h2>
+<pre><code class="language-bash">cp config/nvidia-200k.env.example .env
+</code></pre>
+<p>Edit <code>.env</code>: set <code>QWEN38_MODEL_PATH</code> to the absolute downloaded directory, replace <code>QWEN38_GPU_DEVICE</code> with the <strong>UUID of your idle 96 GB Blackwell GPU</strong>, set <code>QWEN38_CPU_SET</code> to valid CPUs, and choose a writable absolute <code>QWEN38_KERNEL_CACHE</code> directory. Create the cache directory first. Keep the API bound to <code>127.0.0.1</code>.</p>
+<pre><code class="language-bash">set -a
+. ./.env
+set +a
+mkdir -p &quot;$QWEN38_KERNEL_CACHE&quot;
+python3 scripts/preflight.py
+python3 scripts/run.py --print-shell
+python3 scripts/run.py --execute
+</code></pre>
+<p>The last command runs in the foreground. Preflight rejects a busy GPU, insufficient VRAM, an incompatible image, missing model files or an occupied port. Coordinate exclusive GPU ownership before launch; do not stop unrelated services to make preflight pass. The public kit does not include our private GPU lease and power-management services.</p>
+<p>The trusted-model code flag is part of the pinned runtime. Review the publisher and pinned code before launching. Nothing here exposes your inference endpoint to the internet.</p>
+<h2 id="4-verify-readiness-in-a-second-terminal">4. Verify readiness in a second terminal</h2>
+<p>From the same checkout, load the same <code>.env</code>, then run:</p>
+<pre><code class="language-bash">set -a
+. ./.env
+set +a
+python3 scripts/ready.py
+python3 scripts/accept.py --output evidence/acceptance.json
+</code></pre>
+<p>Readiness checks identity, runtime configuration, reasoning and native tool roundtrips. Acceptance adds exact 65,536- and 120,000-token prefill probes and log checks; these consume GPU time. <code>--skip-long-context</code> gives a shorter functional pass, which does not validate long context. A configured 200K window is not proof of high-quality reasoning at 200K. Failed gates need investigation, not threshold changes.</p>
+<h2 id="5-connect-a-client">5. Connect a client</h2>
+<p>Base URL: <code>http://127.0.0.1:11438/v1</code>. Model: <code>qwen3.8-flash-next-sglang</code>. API style: Chat Completions, with streaming and native tool calls. Our coding client uses the name <code>flash-medium</code>; that client profile is not bundled or required for API use.</p>
+<pre><code class="language-bash">curl --fail-with-body http://127.0.0.1:11438/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    &quot;model&quot;: &quot;qwen3.8-flash-next-sglang&quot;,
+    &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Write a Python function that deduplicates a list while preserving order.&quot;}],
+    &quot;temperature&quot;: 0,
+    &quot;max_tokens&quot;: 32768,
+    &quot;chat_template_kwargs&quot;: {
+      &quot;enable_thinking&quot;: true,
+      &quot;preserve_thinking&quot;: true,
+      &quot;reasoning_effort&quot;: &quot;medium&quot;
+    }
+  }'
+</code></pre>
+<p>For another machine, prefer an SSH tunnel to the loopback API (<code>ssh -L 11438:127.0.0.1:11438 user@your-server</code>). For unattended service use, adapt the existing <a href="https://github.com/dherichsen/qwen38-flash-next-sm120/blob/main/systemd/qwen38-flash-next.service.in">systemd template</a> after a successful foreground acceptance run. Keep exclusive GPU ownership and readiness checks. The public documentation page has no access to your inference server.</p>
+<h2 id="evidence-and-limits">Evidence and limits</h2>
+<p>The September 7 production record reports startup, 65K prefill, reasoning, tool-roundtrip and resource checks passed. One small Hermes coding integration passed its visible and independent checks. This does not establish broad coding superiority or quality throughout the full context window. The older nine-task speed comparison belongs to the August 31 profile and must not be presented as a benchmark of this configuration.</p>
+<p>For this publication, we built the public NVIDIA overlay, verified its changed runtime files against the running service, matched all 3,717 Python/CUDA source files with no differences, and passed 11 configuration/API tests. <a href="current-build-verification.json">Build verification</a> records the exact comparison and any differences. We did <strong>not</strong> load a second copy of the rebuilt image on the occupied GPU or repeat a 200K quality benchmark. Your friend should run acceptance on their own machine.</p>
+<p>If startup is still loading, allow time for checkpoint I/O and kernel compilation. If out of memory, check exclusive GPU ownership, host RAM and the selected UUID; a reduced context profile is a separate configuration to validate. If readiness reports a loader/offload mismatch, verify that both the NVIDIA overlay image and <code>config/nvidia-200k.env.example</code> are selected.</p>
+</article><footer><p>Maintained by <a href="https://github.com/dherichsen">dherichsen</a>. Deployment code: Apache-2.0. Model terms are separate.</p><a href="#guide">Back to top ↑</a></footer></main></div><div id="copy-status" role="status" aria-live="polite"></div></body></html>

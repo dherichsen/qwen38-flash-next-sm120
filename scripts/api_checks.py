@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import time
 import urllib.error
 import urllib.request
@@ -110,11 +111,17 @@ def check_server_info(
     response = http_json(
         base_url, "/get_server_info", timeout=min(timeout, 120), api_key=api_key
     )
+    profile = os.environ.get("QWEN38_PROFILE", "legacy-131k")
+    if profile not in {"legacy-131k", "nvidia-200k"}:
+        raise CheckError("unknown QWEN38_PROFILE")
+    nvidia = profile == "nvidia-200k"
+    context = int(os.environ.get("QWEN38_CONTEXT_LENGTH", "200000" if nvidia else "131072"))
+    capacity = int(os.environ.get("QWEN38_MAX_TOTAL_TOKENS", str(context)))
     expected: dict[str, Any] = {
-        "context_length": 131072,
-        "max_total_num_tokens": 131072,
+        "context_length": context,
+        "max_total_num_tokens": capacity,
         "kv_cache_dtype": "fp8_e4m3",
-        "quantization": "modelopt_fp4",
+        "quantization": "modelopt_mixed" if nvidia else "modelopt_fp4",
         "speculative_algorithm": "EAGLE",
         "speculative_num_steps": 3,
         "speculative_eagle_topk": 1,
@@ -125,6 +132,8 @@ def check_server_info(
         "max_running_requests": 1,
         "served_model_name": model,
     }
+    if nvidia:
+        expected.update(offload_embedding_to_host=True, moe_runner_backend="flashinfer_cutlass")
     mismatches: dict[str, dict[str, Any]] = {}
     for field, wanted in expected.items():
         actual = response.get(field)
@@ -178,9 +187,9 @@ def check_server_info(
         for state in states
         if isinstance(state, dict)
     ]
-    if not token_capacities or any(value != 131072 for value in token_capacities):
+    if not token_capacities or any(value != capacity for value in token_capacities):
         raise CheckError(
-            f"internal token-capacity mismatch: expected 131072, got {token_capacities!r}"
+            f"internal token-capacity mismatch: expected {capacity}, got {token_capacities!r}"
         )
     return {
         "status": "pass",

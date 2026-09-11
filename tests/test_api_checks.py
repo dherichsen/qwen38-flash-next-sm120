@@ -89,6 +89,18 @@ class ApiCheckTests(unittest.TestCase):
                 timeout=30,
             )
 
+    @mock.patch.dict("os.environ", {"QWEN38_PROFILE": "nvidia-200k"}, clear=True)
+    @mock.patch("api_checks.http_json")
+    def test_nvidia_contract_requires_mixed_quantization_and_host_offload(self, http_json):
+        info = self.server_info()
+        info.update(context_length=200000, max_total_num_tokens=200000, quantization="modelopt_mixed", offload_embedding_to_host=True, moe_runner_backend="flashinfer_cutlass")
+        info["internal_states"][0]["memory_usage"]["token_capacity"] = 200000
+        http_json.return_value = info
+        self.assertEqual(api_checks.check_server_info("http://localhost", "qwen3.8-flash-next-sglang", timeout=30)["token_capacities"], [200000])
+        info["offload_embedding_to_host"] = False
+        with self.assertRaisesRegex(api_checks.CheckError, "offload_embedding_to_host"):
+            api_checks.check_server_info("http://localhost", "qwen3.8-flash-next-sglang", timeout=30)
+
     @mock.patch("api_checks.http_json")
     def test_exact_prefill_requires_exact_usage(self, http_json: mock.Mock) -> None:
         http_json.return_value = {

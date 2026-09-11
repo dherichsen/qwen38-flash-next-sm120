@@ -29,3 +29,9 @@ git format-patch --stdout --full-index --binary -1 <rebased-commit>
 
 Do not replace the pins with moving PR heads. Any update is a new candidate and
 must receive new tree hashes and acceptance evidence.
+
+## September 7 NVIDIA compatibility overlay (published September 11)
+
+`0003-nvidia-mixed-host-offload.patch` is the local deployment delta on top of the original composed tree. It was reconstructed from the exact 16 runtime files and seven test files copied into the production NVIDIA compatibility image, not from a broader experimental branch. Existing source copyright and license headers remain intact; original SGLang code remains Apache-2.0. This local integration is not claimed to be a merged upstream patch. The delta covers mixed-precision ModelOpt loading, host embedding gather/offload, SM120 backend selection, routing order and related compatibility tests. Unrelated DFlash experiments are excluded.
+
+`config/nvidia-source-manifest.json` records original and deployed SHA256 per file. The new-file entries have a null base hash. The builder refuses a base or result mismatch. One upstream source whitespace-only line is retained for byte-for-byte runtime matching. `docs/current-build-verification.json` records comparison with the running deployment. The original base-tree label identifies ancestry, not the entire patched source tree.

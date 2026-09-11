@@ -67,6 +67,11 @@ def check_image(config: RuntimeConfig) -> dict[str, Any]:
             f"source-tree label mismatch: expected={EXPECTED_SOURCE_TREE} "
             f"actual={source_tree}"
         )
+    if config.profile == "nvidia-200k":
+        import hashlib
+        expected = hashlib.sha256((Path(__file__).resolve().parents[1] / "patches/0003-nvidia-mixed-host-offload.patch").read_bytes()).hexdigest()
+        if labels.get("ai.qwen38.nvidia.patch-sha256") != expected:
+            raise PreflightError("NVIDIA compatibility overlay is missing or differs")
     return {"reference": config.image, "id": image_id, "source_tree": source_tree}
 
 

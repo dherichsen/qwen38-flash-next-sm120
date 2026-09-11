@@ -66,6 +66,7 @@ def env_flag(env: Mapping[str, str], name: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
+    profile: str
     model_path: Path
     image: str
     image_id: str
@@ -92,6 +93,7 @@ class RuntimeConfig:
             raise ConfigError("QWEN38_MODEL_PATH is required")
 
         config = cls(
+            profile=_text(values, "QWEN38_PROFILE", "legacy-131k"),
             model_path=Path(model_raw),
             image=_text(
                 values,
@@ -140,6 +142,8 @@ class RuntimeConfig:
         return config
 
     def validate(self) -> None:
+        if self.profile not in {"legacy-131k", "nvidia-200k"}:
+            raise ConfigError("unknown QWEN38_PROFILE")
         if not self.model_path.is_absolute():
             raise ConfigError("QWEN38_MODEL_PATH must be absolute")
         if not self.kernel_cache.is_absolute():
@@ -254,7 +258,7 @@ class RuntimeConfig:
             "1",
             "--trust-remote-code",
             "--quantization",
-            "modelopt_fp4",
+            "modelopt_mixed" if self.profile == "nvidia-200k" else "modelopt_fp4",
             "--fp4-gemm-backend",
             "flashinfer_cutlass",
             "--context-length",
@@ -308,7 +312,7 @@ class RuntimeConfig:
             "0.0.0.0",
             "--port",
             str(self.container_port),
-        ]
+        ] + (["--moe-runner-backend", "flashinfer_cutlass", "--offload-embedding-to-host"] if self.profile == "nvidia-200k" else [])
 
 
 def shell_join(argv: list[str]) -> str:

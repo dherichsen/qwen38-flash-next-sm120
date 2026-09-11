@@ -1,0 +1,12 @@
+{
+  "verified_date": "2026-09-11",
+  "source_files_live": 3717,
+  "source_files_rebuilt": 3717,
+  "differences": {},
+  "runtime_overlay_files_verified": 16,
+  "overlay_source_and_test_files_verified": 23,
+  "configuration_tests_passed": 11,
+  "rebuilt_image_gpu_load_tested": false,
+  "production_image_id": "sha256:dadb5efbeea1212236f6a67f2fe4ce66c6ded184539bb477f0982b3c3cb84632",
+  "public_rebuild_image_id": "sha256:113870456860234a040740681c7567d25c0427b3027b34b5095f9f8b2db344f3"
+}

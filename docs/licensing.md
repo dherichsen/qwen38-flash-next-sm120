@@ -20,3 +20,9 @@ redistributing, or serving any checkpoint:
 
 Nothing in this repository grants rights to a checkpoint, Qwen trademarks, or
 third-party datasets. This summary is informational, not legal advice.
+
+## Current NVIDIA profile (September 11, 2026)
+
+The new guide uses the public `nvidia/Qwen3.8-Flash-Next-NVFP4` checkpoint. Its current model card names the NVIDIA Open Model License as governing terms and links the Qwen Community License as additional information. Read those linked terms and the pinned model files directly; the older private-candidate description above concerns the historical profile. No model weights are distributed here.
+
+https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4

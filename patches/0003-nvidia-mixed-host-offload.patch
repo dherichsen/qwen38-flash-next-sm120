@@ -1,0 +1,1328 @@
+--- a/python/sglang/kernels/jit/csrc/moe/route_radix.cuh
++++ b/python/sglang/kernels/jit/csrc/moe/route_radix.cuh
+@@ -142,9 +142,10 @@
+     // radix math below is fp32 either way — only the load width differs.
+     AlignedVector<packed_t<TScore>, kVecSize / 2> scores_vec;
+ 
+-    // prefetch bias (frozen weight) before the PDL wait
++    // Bias may be produced by a preceding cast or fill kernel (the caller
++    // does not guarantee a frozen weight), so wait before loading either input.
++    PDLWaitPrimary<kUsePDL>();
+     bias_vec.load(params.bias, tx);
+-    PDLWaitPrimary<kUsePDL>();
+     scores_vec.load(scores, tx);
+ 
+ #pragma unroll
+--- a/python/sglang/kernels/ops/embeddings/__init__.py
++++ b/python/sglang/kernels/ops/embeddings/__init__.py
+@@ -14,4 +14,14 @@
+     )
+ )
+ 
++register_kernel(
++    KernelSpec(
++        op="embeddings.host_embedding_gather",
++        backend=KernelBackend.TRITON,
++        target=(
++            "sglang.kernels.ops.embeddings.host_embedding_gather:host_embedding_gather"
++        ),
++    )
++)
++
+ __all__ = []
+--- /dev/null
++++ b/python/sglang/kernels/ops/embeddings/host_embedding_gather.py
+@@ -0,0 +1,91 @@
++"""Zero-copy gather of embedding rows from a page-locked host table.
++
++The embedding table stays in pinned host memory and the GPU reads the requested
++rows directly over PCIe through unified virtual addressing (UVA). Compared with
++a host-side ``index_select`` followed by a device copy, this needs no
++host/device synchronisation and no staging buffer, and the launch is a plain
++kernel launch, so it can be captured in a CUDA graph.
++
++A decode step gathers a handful of rows (a few microseconds); a 1024-token
++prefill chunk moves ~10 MB for a 5120-wide table and runs at PCIe bandwidth
++(~0.4 ms on PCIe 4.0 x16).
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++_TORCH_TO_TRITON_DTYPE = {
++    torch.float32: tl.float32,
++    torch.float16: tl.float16,
++    torch.bfloat16: tl.bfloat16,
++}
++
++
++@triton.jit
++def _host_embedding_gather_kernel(
++    input_ptr,
++    # Raw host address of the pinned table, cast to a typed pointer below. The
++    # launcher receives a plain integer so no device-placement check is applied
++    # to what is, from PyTorch's point of view, a CPU tensor.
++    table_addr,
++    out_ptr,
++    hidden_dim: tl.constexpr,
++    table_stride0: tl.constexpr,
++    DTYPE: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++):
++    # Widen first: Triton specialises small integer arguments to i32 and
++    # int_to_ptr needs a 64-bit operand.
++    table_ptr = table_addr.to(tl.int64).to(tl.pointer_type(DTYPE))
++    row = tl.program_id(0).to(tl.int64)
++    col_block = tl.program_id(1)
++    cols = col_block * BLOCK_H + tl.arange(0, BLOCK_H)
++    col_mask = cols < hidden_dim
++
++    token = tl.load(input_ptr + row).to(tl.int64)
++    vals = tl.load(table_ptr + token * table_stride0 + cols, mask=col_mask, other=0.0)
++    tl.store(out_ptr + row * hidden_dim + cols, vals, mask=col_mask)
++
++
++def host_embedding_gather(input_: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
++    """Return ``table[input_]`` where ``table`` lives in pinned host memory.
++
++    ``input_`` is a CUDA int32/int64 tensor of any shape; the result has shape
++    ``(*input_.shape, hidden_dim)`` on the same device with the table's dtype.
++    Out-of-range ids are not checked here (the caller masks or asserts them):
++    an out-of-range host read is an illegal address for the GPU.
++    """
++    assert input_.is_cuda
++    assert input_.dtype in (torch.int32, torch.int64)
++    assert table.device.type == "cpu"
++    # cudaPointerGetAttributes is not a stream op, but keep it out of capture
++    # anyway: the table's residency is fixed for the process lifetime.
++    if not torch.cuda.is_current_stream_capturing():
++        assert table.is_pinned(), "host embedding table must be in pinned memory"
++    assert table.ndim == 2
++    assert table.stride(1) == 1
++    assert table.dtype in _TORCH_TO_TRITON_DTYPE
++
++    input_ = input_.contiguous()
++    hidden_dim = table.shape[1]
++    output = torch.empty(
++        (*input_.shape, hidden_dim), dtype=table.dtype, device=input_.device
++    )
++    n_tokens = input_.numel()
++    if n_tokens == 0:
++        return output
++
++    block_h = min(1024, triton.next_power_of_2(hidden_dim))
++    grid = (n_tokens, triton.cdiv(hidden_dim, block_h))
++    _host_embedding_gather_kernel[grid](
++        input_,
++        table.data_ptr(),
++        output,
++        hidden_dim,
++        table.stride(0),
++        DTYPE=_TORCH_TO_TRITON_DTYPE[table.dtype],
++        BLOCK_H=block_h,
++        num_warps=4,
++    )
++    return output
+--- a/python/sglang/kernels/ops/moe/moe_fused_gate.py
++++ b/python/sglang/kernels/ops/moe/moe_fused_gate.py
+@@ -1,7 +1,7 @@
+ from __future__ import annotations
+ 
+ import logging
+-from typing import TYPE_CHECKING, Tuple
++from typing import TYPE_CHECKING, Optional, Tuple
+ 
+ import torch
+ import triton
+@@ -109,6 +109,7 @@
+     HAS_SOFTCAP: tl.constexpr,  # tanh softcapping (softmax only)
+     RENORMALIZE: tl.constexpr,
+     APPLY_SCALE: tl.constexpr,  # apply_routed_scaling_factor_on_output
++    HAS_BIAS: tl.constexpr,
+     USE_PDL: tl.constexpr,
+     stride_sm,
+     stride_sn,
+@@ -126,13 +127,18 @@
+     mask_m = offs_m < M
+     mask_n = offs_n < N
+ 
+-    # prefetch bias before PDL wait
+-    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(
+-        tl.float32
+-    )  # [BLOCK_N]
+-
++    # PDL may start this grid before prior kernel stores are visible. Bias can
++    # be produced by a preceding cast or fill kernel, so wait before loading
++    # either bias or scores.
+     if USE_PDL:
+         tl.extra.cuda.gdc_wait()
++
++    # Plain softmax routing has no bias, so keep the zero value in registers
++    # rather than materializing and clearing a device tensor per call.
++    if HAS_BIAS:
++        bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
++    else:
++        bias = tl.zeros([BLOCK_N], dtype=tl.float32)
+ 
+     row_ptr = scores_ptr + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
+     mask2d = mask_m[:, None] & mask_n[None, :]
+@@ -254,7 +260,7 @@
+ @debug_kernel_api
+ def moe_fused_gate(
+     scores: torch.Tensor,
+-    bias: torch.Tensor,
++    bias: Optional[torch.Tensor],
+     topk: int,
+     scoring_func: str = "sigmoid",
+     num_fused_shared_experts: int = 0,
+@@ -282,10 +288,24 @@
+         torch.float16,
+         torch.bfloat16,
+     ), "scores must be float32/float16/bfloat16"
+-    assert bias.dtype == torch.float32, "bias must be float32"
+     assert scores.ndim == 2, "scores must be 2D"
+-    assert bias.ndim == 1, "bias must be 1D"
+-    assert scores.size(1) == bias.size(0), "scores and bias must have same num_experts"
++    if bias is None:
++        assert (
++            scoring_func.lower() == "softmax"
++        ), "bias is required for non-softmax routing"
++    else:
++        # The kernel loads the bias and upcasts it to fp32 in-register (see
++        # _router_triton_kernel), so a non-fp32 bias (DeepSeek-V4 stores the
++        # correction bias in bf16) needs no host-side cast/copy.
++        assert bias.dtype in (
++            torch.float32,
++            torch.float16,
++            torch.bfloat16,
++        ), "bias must be float32/float16/bfloat16"
++        assert bias.ndim == 1, "bias must be 1D"
++        assert scores.size(1) == bias.size(
++            0
++        ), "scores and bias must have same num_experts"
+     assert topk > num_fused_shared_experts, "topk must be > num_fused_shared_experts"
+     if routed_scaling_factor is None:
+         routed_scaling_factor = 1.0
+@@ -342,7 +362,7 @@
+     extra = {"launch_pdl": True} if use_pdl else {}
+     _router_triton_kernel[grid](
+         scores,
+-        bias,
++        bias if bias is not None else scores,
+         weights,
+         indices,
+         M,
+@@ -362,6 +382,7 @@
+         HAS_SOFTCAP=bool(moe_softcapping != 0.0),
+         RENORMALIZE=bool(renormalize),
+         APPLY_SCALE=bool(apply_routed_scaling_factor_on_output),
++        HAS_BIAS=bias is not None,
+         USE_PDL=use_pdl,
+         stride_sm=scores.stride(0),
+         stride_sn=scores.stride(1),
+--- a/python/sglang/srt/arg_groups/overrides.py
++++ b/python/sglang/srt/arg_groups/overrides.py
+@@ -1421,6 +1421,18 @@
+     return {}
+ 
+ 
++def _mixed_precision_moe_quant_algos(hf_config: Any) -> set:
++    """quant_algo values ModelOpt MIXED_PRECISION assigns to `*.experts` layers."""
++    quantization_config = getattr(hf_config, "quantization_config", None)
++    if not isinstance(quantization_config, dict):
++        return set()
++    return {
++        str(info.get("quant_algo", "")).upper()
++        for name, info in quantization_config.get("quantized_layers", {}).items()
++        if ".experts" in name and isinstance(info, dict)
++    }
++
++
+ @_register_for(
+     "Qwen3MoeForCausalLM",
+     "Qwen3VLMoeForConditionalGeneration",
+@@ -1442,8 +1454,27 @@
+         ):
+             overrides["quantization"] = quant_method
+             quantization = quant_method
+-        if (
+-            (quantization in ("fp8", "modelopt_fp4") or quantization is None)
++        has_w4a16_moe_layers = (
++            quantization == "modelopt_mixed"
++            and "W4A16_NVFP4" in _mixed_precision_moe_quant_algos(hf_config)
++        )
++        if has_w4a16_moe_layers:
++            # trtllm-gen only has the W4A4 NVFP4 MoE path.
++            if server_args.moe_runner_backend not in ("auto", "marlin"):
++                raise ValueError(
++                    "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin."
++                )
++            if server_args.moe_runner_backend == "auto":
++                overrides["moe_runner_backend"] = "marlin"
++                logger.info(
++                    "Use marlin as MoE runner backend for "
++                    f"{hf_config.architectures[0]} with W4A16_NVFP4 MoE layers"
++                )
++        elif (
++            (
++                quantization in ("fp8", "modelopt_fp4", "modelopt_mixed")
++                or quantization is None
++            )
+             and server_args.moe_a2a_backend == "none"
+             and server_args.moe_runner_backend == "auto"
+         ):
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -881,14 +881,9 @@
+                 moe_fused_gate as _jit_moe_fused_gate,
+             )
+ 
+-            zero_bias = torch.zeros(
+-                gating_output.shape[1],
+-                dtype=torch.float32,
+-                device=gating_output.device,
+-            )
+             topk_weights, topk_ids = _jit_moe_fused_gate(
+                 gating_output,
+-                zero_bias,
++                None,
+                 topk,
+                 scoring_func="softmax",
+                 renormalize=renormalize,
+--- a/python/sglang/srt/layers/quantization/fp4_utils.py
++++ b/python/sglang/srt/layers/quantization/fp4_utils.py
+@@ -98,6 +98,7 @@
+     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+     FLASHINFER_CUTLASS = "flashinfer_cutlass"
+     FLASHINFER_TRTLLM = "flashinfer_trtllm"
++    FLASHINFER_B12X = "flashinfer_b12x"
+     MARLIN = "marlin"
+ 
+     def is_auto(self) -> bool:
+@@ -115,6 +116,9 @@
+     def is_flashinfer_cutedsl(self) -> bool:
+         return self == Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL
+ 
++    def is_flashinfer_b12x(self) -> bool:
++        return self == Fp4GemmRunnerBackend.FLASHINFER_B12X
++
+     def is_marlin(self) -> bool:
+         return self == Fp4GemmRunnerBackend.MARLIN
+ 
+@@ -130,6 +134,7 @@
+             'flashinfer_cutlass' -> 'cutlass'
+             'flashinfer_cudnn' -> 'cudnn'
+             'flashinfer_cutedsl' -> 'cute-dsl'
++            'flashinfer_b12x' -> 'b12x'
+         """
+         if self == Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL:
+             return "cute-dsl"
+@@ -152,6 +157,8 @@
+             backend = "flashinfer_cutedsl"
+         elif is_cuda() and (10, 0) > get_device_capability() >= (8, 0):
+             backend = "marlin"
++        elif is_cuda() and get_device_capability()[0] == 12:
++            backend = "flashinfer_b12x"
+         else:
+             backend = "flashinfer_cutlass"
+ 
+--- a/python/sglang/srt/layers/quantization/fp8.py
++++ b/python/sglang/srt/layers/quantization/fp8.py
+@@ -2335,6 +2335,18 @@
+                 moe_runner_backend = MoeRunnerBackend.TRITON
+ 
+         if (
++            moe_runner_backend.is_flashinfer_cutlass()
++            or moe_runner_backend.is_flashinfer_cutedsl()
++        ):
++            # Neither runner has an fp8 MoE path; they get pinned globally for
++            # NVFP4 experts on sm120, so run this layer's fp8 experts on triton.
++            logger.info(
++                "Fp8MoEMethod has no %s path; using triton for its fp8 experts.",
++                moe_runner_backend.name,
++            )
++            moe_runner_backend = MoeRunnerBackend.TRITON
++
++        if (
+             moe_runner_backend.is_deep_gemm()
+             or moe_runner_backend.is_triton()
+             or moe_runner_backend.is_aiter()
+--- a/python/sglang/srt/layers/quantization/modelopt_quant.py
++++ b/python/sglang/srt/layers/quantization/modelopt_quant.py
+@@ -739,11 +739,13 @@
+         nvfp4_config: ModelOptFp4Config,
+         nvfp4a16_config: ModelOptFp4Config,
+         mxfp8_config: Fp8Config,
++        fp8_block_config: Fp8Config,
+     ) -> None:
+         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
+         self.quantized_layers = quantized_layers
+         self.fp8_config = fp8_config
+         self.mxfp8_config = mxfp8_config
++        self.fp8_block_config = fp8_block_config
+         self.nvfp4_config = nvfp4_config
+         self.nvfp4a16_config = nvfp4a16_config
+ 
+@@ -800,6 +802,9 @@
+             exclude_modules = quantization_section.get("exclude_modules")
+             quantized_layers = quantization_section.get("quantized_layers", {})
+ 
++        # ModelOpt emits `ignore: []` or omits it; is_layer_skipped iterates it.
++        exclude_modules = list(exclude_modules or [])
++
+         if quant_algo != "MIXED_PRECISION":
+             raise ValueError(
+                 "ModelOptMixedPrecisionConfig only supports MIXED_PRECISION checkpoints."
+@@ -834,6 +839,13 @@
+             packed_modules_mapping=packed_modules_mapping,
+             use_mxfp8=True,
+         )
++        # ModelOpt FP8_BLOCK_SCALES: 128x128 block fp8 with weight_scale_inv.
++        fp8_block_config = Fp8Config(
++            is_checkpoint_fp8_serialized=True,
++            activation_scheme="dynamic",
++            weight_block_size=[128, 128],
++            packed_modules_mapping=packed_modules_mapping,
++        )
+         nvfp4_config = ModelOptFp4Config(
+             is_checkpoint_nvfp4_serialized=True,
+             kv_cache_quant_algo=kv_cache_quant_algo,
+@@ -857,6 +869,7 @@
+             quantized_layers=quantized_layers,
+             fp8_config=fp8_config,
+             mxfp8_config=mxfp8_config,
++            fp8_block_config=fp8_block_config,
+             nvfp4_config=nvfp4_config,
+             nvfp4a16_config=nvfp4a16_config,
+         )
+@@ -915,8 +928,16 @@
+             candidates.append(
+                 "language_model.model." + prefix[len("model.language_model.") :]
+             )
++            candidates.append("model." + prefix[len("model.language_model.") :])
++        elif prefix.startswith("model."):
++            # VL models such as Qwen4-Exp name the text stack `model.layers.*`
++            # while ModelOpt keys it `model.language_model.layers.*`.
++            candidates.append("model.language_model." + prefix[len("model.") :])
+ 
+         return tuple(dict.fromkeys(candidates))
++
++    def resolve_quant_algo(self, prefix: str) -> Optional[str]:
++        return self._resolve_quant_algo(prefix)
+ 
+     def get_quant_method(
+         self, layer: torch.nn.Module, prefix: str
+@@ -937,6 +958,8 @@
+                 return UnquantizedLinearMethod()
+             if quant_algo == "FP8":
+                 return ModelOptFp8LinearMethod(self.fp8_config)
++            if quant_algo == "FP8_BLOCK_SCALES":
++                return Fp8LinearMethod(self.fp8_block_config)
+             if quant_algo == "MXFP8":
+                 return Fp8LinearMethod(self.mxfp8_config)
+             if quant_algo == "NVFP4":
+@@ -966,6 +989,8 @@
+                 return ModelOptFp8MoEMethod(self.fp8_config)
+             if quant_algo == "MXFP8":
+                 return Fp8MoEMethod(self.mxfp8_config)
++            if quant_algo == "FP8_BLOCK_SCALES":
++                return Fp8MoEMethod(self.fp8_block_config)
+             if quant_algo == "NVFP4":
+                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
+             if quant_algo == "W4A16_NVFP4":
+--- a/python/sglang/srt/layers/vocab_parallel_embedding.py
++++ b/python/sglang/srt/layers/vocab_parallel_embedding.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/layers/vocab_parallel_embedding.py
+ 
++import contextlib
+ import logging
+ from dataclasses import dataclass
+ from typing import List, Optional, Sequence, Tuple
+@@ -9,6 +10,9 @@
+ import torch
+ from torch.nn.parameter import Parameter, UninitializedParameter
+ 
++from sglang.kernels.ops.embeddings.host_embedding_gather import (
++    host_embedding_gather,
++)
+ from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
+     vocab_parallel_embedding as fused_vocab_parallel_embedding,
+ )
+@@ -35,7 +39,7 @@
+     method_has_implemented_embedding,
+ )
+ from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+-from sglang.srt.runtime_context import get_parallel
++from sglang.srt.runtime_context import get_exec, get_parallel
+ from sglang.srt.utils import (
+     cpu_has_amx_support,
+     get_compiler_backend,
+@@ -46,6 +50,36 @@
+ from sglang.srt.utils.async_probe import maybe_detect_oob
+ 
+ DEFAULT_VOCAB_PADDING_SIZE = 64
++
++# Tables below this size stay on the device when host offload is requested:
++# a PCIe read buys nothing for a vision tower's position table.
++HOST_OFFLOAD_MIN_BYTES = 64 << 20
++
++
++def _host_offload_requested() -> bool:
++    """``--offload-embedding-to-host``; False when no config is published
++    (layers built outside a server, e.g. in unit tests)."""
++    try:
++        return bool(get_exec().offload.offload_embedding_to_host)
++    except Exception:
++        return False
++
++
++def _config_ties_word_embeddings() -> bool:
++    """Return True when the model config sets ``tie_word_embeddings``.
++
++    Tied embeddings share their ``nn.Parameter`` with the LM head, so
++    moving the embedding to the host would also move the logits weight and
++    break the sampler's device matmul.
++    """
++    try:
++        from sglang.srt.runtime_context import get_server_args
++
++        hf_config = get_server_args().get_model_config().hf_config
++        return bool(getattr(hf_config, "tie_word_embeddings", False))
++    except Exception:
++        return False
++
+ 
+ _is_cpu_amx_available = cpu_has_amx_support()
+ _is_cpu = is_cpu()
+@@ -245,6 +279,7 @@
+     ):
+         super().__init__()
+         self.quant_config = quant_config
++        self.prefix = prefix
+         self.output_dtype = output_dtype
+ 
+         self.enable_tp = enable_tp
+@@ -337,15 +372,44 @@
+             - self.shard_indices.added_vocab_start_index
+         )
+ 
+-        self.quant_method.create_weights(
+-            self,
+-            self.embedding_dim,
+-            [self.num_embeddings_per_partition],
+-            self.embedding_dim,
+-            self.num_embeddings_padded,
+-            params_dtype=params_dtype,
+-            weight_loader=self.weight_loader,
+-        )
++        # Input-embedding layers only (an LM head feeds a matmul). When the
++        # table is to live on the host, build it there straight away: a device
++        # tensor created and dropped here would only sit in the allocator cache
++        # (the caching allocator does not hand its pieces to the layers built
++        # afterwards), and the free-memory measurement that sizes the KV pool
++        # would never see it.
++        place_on_host = (
++            is_embedding_layer
++            and _host_offload_requested()
++            and isinstance(quant_method, UnquantizedEmbeddingMethod)
++            and params_dtype in (torch.float32, torch.float16, torch.bfloat16)
++            and self.num_embeddings_per_partition
++            * embedding_dim
++            * torch.empty((), dtype=params_dtype, device="cpu").element_size()
++            >= HOST_OFFLOAD_MIN_BYTES
++            # Meta-device construction is materialised later; the post-load
++            # fallback (offload_weight_to_host) takes over in that case.
++            and torch.empty(()).device.type == "cuda"
++            # Tied embeddings share their Parameter with an LM head; moving
++            # the table to the host would break the logits matmul.  The
++            # model config is not always reachable here, but _host_offload
++            # is only called from VocabParallelEmbedding.__init__ where the
++            # caller has not yet called tie_weights, so the tie is unknown.
++            # We conservatively check the HF config when available.
++            and not _config_ties_word_embeddings()
++        )
++        with torch.device("cpu") if place_on_host else contextlib.nullcontext():
++            self.quant_method.create_weights(
++                self,
++                self.embedding_dim,
++                [self.num_embeddings_per_partition],
++                self.embedding_dim,
++                self.num_embeddings_padded,
++                params_dtype=params_dtype,
++                weight_loader=self.weight_loader,
++            )
++        if place_on_host:
++            self._pin_host_weight()
+ 
+     @classmethod
+     def _get_indices(
+@@ -526,6 +590,102 @@
+             and self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
+         )
+ 
++    def _pin_host_weight(self) -> None:
++        """Replace a pageable host table with a page-locked copy the GPU can
++        read (see ``host_embedding_gather``)."""
++        weight = self.weight
++        assert weight.device.type == "cpu"
++        self.weight.data = weight.data.pin_memory()
++        self._host_weight_verified = True
++        logger.info(
++            "Embedding table %s created in pinned host memory (%.2f GiB)",
++            self.prefix or type(self).__name__,
++            weight.numel() * weight.element_size() / (1 << 30),
++        )
++
++    def offload_weight_to_host(self) -> int:
++        """Move the embedding table to page-locked host memory.
++
++        The lookup then gathers rows straight from the host over PCIe
++        (:func:`host_embedding_gather`), so the table costs no device memory
++        and no host/device synchronisation. Returns the number of device bytes
++        released, 0 if nothing was moved. Only unquantized fp32/fp16/bf16
++        tables living on a CUDA device are eligible.
++        """
++        weight = self.weight
++        if not weight.is_cuda:
++            return 0
++        if weight.numel() * weight.element_size() < HOST_OFFLOAD_MIN_BYTES:
++            return 0
++        if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
++            logger.warning(
++                "Not offloading %s to host: quantized embedding method %s",
++                type(self).__name__,
++                type(self.quant_method).__name__,
++            )
++            return 0
++        if weight.ndim != 2 or weight.dtype not in (
++            torch.float32,
++            torch.float16,
++            torch.bfloat16,
++        ):
++            logger.warning(
++                "Not offloading %s to host: unsupported weight %s %s",
++                type(self).__name__,
++                tuple(weight.shape),
++                weight.dtype,
++            )
++            return 0
++        host = torch.empty(
++            weight.shape, dtype=weight.dtype, device="cpu", pin_memory=True
++        )
++        host.copy_(weight)
++        nbytes = weight.numel() * weight.element_size()
++        # Keep the Parameter object (weight_loader and friends hang off it);
++        # only its storage moves. The device copy dies with `weight`.
++        self.weight.data = host
++        self._host_weight_verified = True
++        logger.info(
++            "Embedding table %s moved to pinned host memory (%.2f GiB)",
++            self.prefix or type(self).__name__,
++            nbytes / (1 << 30),
++        )
++        return nbytes
++
++    def _weight_is_host_resident(self, input_: torch.Tensor) -> bool:
++        if self.weight.device.type != "cpu" or not input_.is_cuda:
++            return False
++        if not getattr(self, "_host_weight_verified", False):
++            # The table can also arrive through weight sharing (a draft model
++            # handed the target's embedding); make sure the GPU may read it.
++            if not self.weight.is_pinned():
++                raise RuntimeError(
++                    "VocabParallelEmbedding weight is on the host but not pinned; "
++                    "CUDA inputs cannot be embedded from pageable memory."
++                )
++            self._host_weight_verified = True
++        return True
++
++    def _embed_local_shard_from_host(
++        self, input_: torch.Tensor, symm_alloc
++    ) -> torch.Tensor:
++        """Host-resident table: same contract as ``_embed_local_shard``."""
++        if self.tp_size == 1:
++            with symm_alloc:
++                return host_embedding_gather(input_, self.weight)
++        masked_input, input_mask = get_masked_input_and_mask(
++            input_,
++            self.shard_indices.org_vocab_start_index,
++            self.shard_indices.org_vocab_end_index,
++            self.shard_indices.num_org_vocab_padding,
++            self.shard_indices.added_vocab_start_index,
++            self.shard_indices.added_vocab_end_index,
++        )
++        with symm_alloc:
++            output_parallel = host_embedding_gather(masked_input, self.weight)
++        output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
++        return output_parallel
++
+     def _embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
+         """Embed against the local vocab shard; out-of-shard rows are zero
+         (identity when tp_size == 1).
+@@ -537,6 +697,11 @@
+         symm_alloc = use_symmetric_memory(
+             get_tp_group(), disabled=not is_allocation_symmetric()
+         )
++        if self._weight_is_host_resident(input_):
++            output_parallel = self._embed_local_shard_from_host(input_, symm_alloc)
++            if self.output_dtype is not None:
++                output_parallel = output_parallel.to(self.output_dtype)
++            return output_parallel
+         if self.tp_size == 1:
+             with symm_alloc:
+                 output_parallel = self.quant_method.embedding(self, input_.long())
+@@ -598,6 +763,42 @@
+         return s
+ 
+ 
++def offload_input_embeddings_to_host(
++    model: torch.nn.Module,
++) -> List[Tuple[str, int]]:
++    """Offload any input-embedding table of ``model`` still on the device.
++
++    Tables are normally placed on the host at construction (see
++    ``VocabParallelEmbedding.__init__``); this catches the ones built on a
++    meta device and materialised later. LM heads (``ParallelLMHead``) are
++    left alone: they feed a matmul, not a gather. Embeddings that share
++    their weight tensor with an LM head (``tie_word_embeddings``) are also
++    skipped, because moving the shared tensor would break the logits matmul.
++    Returns ``(module_name, device_bytes_released)`` per table moved.
++    """
++    # Collect data pointers of all LM-head weights so we can detect ties.
++    lm_head_ptrs: set = set()
++    for module in model.modules():
++        if isinstance(module, ParallelLMHead):
++            w = getattr(module, "weight", None)
++            if w is not None:
++                lm_head_ptrs.add(w.data.data_ptr())
++
++    moved = []
++    for name, module in model.named_modules():
++        if not isinstance(module, VocabParallelEmbedding) or isinstance(
++            module, ParallelLMHead
++        ):
++            continue
++        if module.weight.data.data_ptr() in lm_head_ptrs:
++            logger.info("Not offloading %s: weight is tied with an LM head", name)
++            continue
++        nbytes = module.offload_weight_to_host()
++        if nbytes:
++            moved.append((name, nbytes))
++    return moved
++
++
+ class ParallelLMHead(VocabParallelEmbedding):
+     """Parallelized LM head.
+ 
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -1048,6 +1048,38 @@
+             server_args=self.server_args, gpu_id=self.gpu_id
+         )
+ 
++    def _offload_input_embeddings_to_host(self) -> None:
++        """``--offload-embedding-to-host``: make sure the input embedding
++        table(s) live in pinned host memory. They are normally placed there at
++        construction; this moves any table that still sits on the device (built
++        on a meta device, materialised at load) before the free-memory
++        measurement that sizes the KV pool."""
++        if self.device != "cuda":
++            raise ValueError("--offload-embedding-to-host requires a CUDA device")
++        from sglang.srt.layers.vocab_parallel_embedding import (
++            ParallelLMHead,
++            VocabParallelEmbedding,
++            offload_input_embeddings_to_host,
++        )
++
++        moved = offload_input_embeddings_to_host(self.model)
++        for name, nbytes in moved:
++            logger.info(
++                f"Offloaded input embedding {name} ({nbytes / (1 << 30):.2f} GB) "
++                "to pinned host memory after loading"
++            )
++        on_host = [
++            name
++            for name, module in self.model.named_modules()
++            if isinstance(module, VocabParallelEmbedding)
++            and not isinstance(module, ParallelLMHead)
++            and module.weight.device.type == "cpu"
++        ]
++        if not on_host:
++            logger.warning(
++                "--offload-embedding-to-host: no eligible input embedding table found"
++            )
++
+     def load_model(self):
+         tic_total = time.perf_counter()
+         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+@@ -1117,6 +1149,8 @@
+ 
+         if not self.is_draft_worker:
+             get_offloader().post_init()
++            if get_exec().offload.offload_embedding_to_host:
++                self._offload_input_embeddings_to_host()
+ 
+         self.maybe_precompile_model_kernels_after_loading()
+ 
+--- a/python/sglang/srt/model_executor/model_runner_components/startup_weight_load.py
++++ b/python/sglang/srt/model_executor/model_runner_components/startup_weight_load.py
+@@ -79,6 +79,7 @@
+     ep_size: int
+     cpu_offload_gb: int
+     offload_group_size: int
++    offload_embedding_to_host: bool
+     enable_memory_saver: bool
+     enable_weights_cpu_backup: bool
+     enable_lora: bool
+@@ -116,6 +117,7 @@
+             ep_size=server_args.ep_size,
+             cpu_offload_gb=server_args.cpu_offload_gb,
+             offload_group_size=server_args.offload_group_size,
++            offload_embedding_to_host=server_args.offload_embedding_to_host,
+             enable_memory_saver=server_args.enable_memory_saver,
+             enable_weights_cpu_backup=server_args.enable_weights_cpu_backup,
+             enable_lora=server_args.enable_lora,
+@@ -367,6 +369,10 @@
+                 options.offload_group_size > 0,
+                 "layer-group offloading is not supported",
+             ),
++            (
++                options.offload_embedding_to_host,
++                "embedding host offload is not supported",
++            ),
+             (options.enable_memory_saver, "memory saver is not supported"),
+             (
+                 options.enable_weights_cpu_backup,
+--- a/python/sglang/srt/model_executor/runner/flashinfer_autotune.py
++++ b/python/sglang/srt/model_executor/runner/flashinfer_autotune.py
+@@ -102,6 +102,7 @@
+     fp4_gemm_needs_autotune = model_uses_fp4 and (
+         get_fp4_gemm_runner_backend().is_flashinfer_cutlass()
+         or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
++        or get_fp4_gemm_runner_backend().is_flashinfer_b12x()
+     )
+ 
+     from sglang.srt.layers.quantization.fp8_utils import (
+--- a/python/sglang/srt/models/qwen3_5_mtp.py
++++ b/python/sglang/srt/models/qwen3_5_mtp.py
+@@ -54,12 +54,14 @@
+     # Serialized Qwen3.5 ModelOpt checkpoints keep embedded MTP weights in
+     # BF16. Disable quantization for those checkpoints; non-serialized
+     # modelopt_fp4 still converts MoE expert weights on load.
++    if quant_config and quant_config.get_name() == "modelopt_mixed":
++        # MIXED_PRECISION lists mtp.* layers only when the MTP head is quantized.
++        if any(name.startswith("mtp.") for name in quant_config.quantized_layers):
++            return quant_config
++        return None
+     if quant_config and (
+-        quant_config.get_name() == "modelopt_mixed"
+-        or (
+-            quant_config.get_name() == "modelopt_fp4"
+-            and quant_config.is_checkpoint_nvfp4_serialized
+-        )
++        quant_config.get_name() == "modelopt_fp4"
++        and quant_config.is_checkpoint_nvfp4_serialized
+     ):
+         return None
+     if is_npu() and get_spec().speculative_draft_model_quantization is None:
+--- a/python/sglang/srt/models/qwen4_exp.py
++++ b/python/sglang/srt/models/qwen4_exp.py
+@@ -43,6 +43,9 @@
+ from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
+ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
++from sglang.srt.layers.quantization.modelopt_quant import (
++    ModelOptMixedPrecisionConfig,
++)
+ from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+ from sglang.srt.layers.utils import get_layer_id
+ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+@@ -68,6 +71,24 @@
+ _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+ 
+ 
++def _ple_table_is_fp8(
++    config: Qwen4ExpTextConfig,
++    quant_config: Optional[QuantizationConfig],
++    prefix: str,
++) -> bool:
++    """fp8 PLE shards: declared by config, an fp8 checkpoint, or a ModelOpt
++    MIXED_PRECISION entry for the ngram table (nvidia/*-Flash-Next-NVFP4)."""
++    if config.ple_embedding_dtype == "float8_e4m3fn":
++        return True
++    if quant_config is None:
++        return False
++    if quant_config.get_name() == "fp8":
++        return True
++    if isinstance(quant_config, ModelOptMixedPrecisionConfig):
++        return quant_config.resolve_quant_algo(prefix) == "FP8"
++    return False
++
++
+ def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
+     if forward_batch._original_forward_mode is not None:
+         return forward_batch._original_forward_mode
+@@ -432,6 +453,7 @@
+         embedding_dim: int,
+         ple_layer_index: int = 0,
+         quant_config: Optional[QuantizationConfig] = None,
++        prefix: str = "",
+     ) -> None:
+         super().__init__()
+         self.config = config
+@@ -488,13 +510,13 @@
+             and get_attention_dp_size() > 1
+             and not self.use_attn_tp_ngram
+         )
++        ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
+         self.ngram_embedding = VocabParallelEmbedding(
+             padded_vocab_size,
+             self.head_dim_per_ngram,
+             params_dtype=(
+                 torch.float8_e4m3fn
+-                if (quant_config is not None and quant_config.get_name() == "fp8")
+-                or getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn"
++                if _ple_table_is_fp8(config, quant_config, ngram_prefix)
+                 else torch.bfloat16
+             ),
+             output_dtype=torch.bfloat16,
+@@ -890,6 +912,7 @@
+             self.ple_embed_dim,
+             ple_layer_index=ple_layer_index,
+             quant_config=quant_config,
++            prefix=f"{prefix}.ple_embedding" if prefix else "ple_embedding",
+         )
+         if config.ple_offload_embedding:
+             self.ple_embedding.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -310,6 +310,7 @@
+     "flashinfer_cutedsl",
+     "flashinfer_cutlass",
+     "flashinfer_trtllm",
++    "flashinfer_b12x",
+     "marlin",
+ ]
+ 
+@@ -2999,6 +3000,15 @@
+         int, "Steps to prefetch in offloading.", NS("exec.offload")
+     ] = 1
+     offload_mode: A[str, "Mode of offloading.", NS("exec.offload")] = "cpu"
++    offload_embedding_to_host: A[
++        bool,
++        "Keep the input embedding table in page-locked host memory instead of "
++        "device memory; rows are gathered directly from the host over PCIe "
++        "(zero-copy, CUDA-graph safe). Frees device memory equal to the table "
++        "size for a few microseconds per forward. CUDA only, unquantized "
++        "embeddings only.",
++        NS("exec.offload"),
++    ] = False
+ 
+     # -------------------------------------------------------------------------
+     # LMCache
+--- /dev/null
++++ b/test/registered/kernels/ops/embeddings/test_host_embedding_gather.py
+@@ -0,0 +1,80 @@
++import pytest
++import torch
++import torch.nn.functional as F
++
++from sglang.kernels.ops.embeddings.host_embedding_gather import host_embedding_gather
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
++
++pytestmark = pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="CUDA is required for this test."
++)
++
++
++def _run_case(input_ids, table):
++    # The gather must be bit-exact with a plain device-side lookup.
++    expected = F.embedding(input_ids.long(), table.cuda())
++    actual = host_embedding_gather(input_ids, table)
++    assert actual.dtype == expected.dtype
++    assert actual.shape == expected.shape
++    assert actual.is_contiguous()
++    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
++@pytest.mark.parametrize("input_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("hidden_dim", [7, 128, 5120])
++def test_host_embedding_gather(dtype, input_dtype, hidden_dim):
++    table = torch.randn((64, hidden_dim), dtype=dtype).pin_memory()
++    input_ids = torch.tensor([0, 63, 5, 5, 17], dtype=input_dtype, device="cuda")
++    _run_case(input_ids, table)
++    # Any input shape is allowed; the hidden dim is appended.
++    _run_case(input_ids.view(5, 1).expand(5, 3).contiguous(), table)
++    # Non-contiguous ids are handled by the wrapper.
++    _run_case(torch.arange(0, 64, device="cuda", dtype=input_dtype)[::4], table)
++
++
++def test_host_embedding_gather_empty_input():
++    table = torch.randn((8, 16), dtype=torch.bfloat16).pin_memory()
++    ids = torch.empty((0,), dtype=torch.int64, device="cuda")
++    out = host_embedding_gather(ids, table)
++    assert out.shape == (0, 16) and out.dtype == torch.bfloat16 and out.is_cuda
++
++
++def test_host_embedding_gather_cuda_graph():
++    # The whole point of reading the host table from the GPU: no host-side
++    # work per lookup, so the launch can live inside a captured graph.
++    table = torch.randn((256, 128), dtype=torch.bfloat16).pin_memory()
++    static_ids = torch.zeros((9,), dtype=torch.int64, device="cuda")
++    stream = torch.cuda.Stream()
++    with torch.cuda.stream(stream):
++        for _ in range(3):
++            host_embedding_gather(static_ids, table)
++    torch.cuda.current_stream().wait_stream(stream)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        static_out = host_embedding_gather(static_ids, table)
++    for _ in range(3):
++        ids = torch.randint(0, 256, (9,), device="cuda")
++        static_ids.copy_(ids)
++        graph.replay()
++        torch.cuda.synchronize()
++        torch.testing.assert_close(
++            static_out, F.embedding(ids, table.cuda()), rtol=0, atol=0
++        )
++
++
++def test_host_embedding_gather_rejects_pageable_table():
++    # A pageable table would be an illegal address for the GPU; refuse it
++    # before launching anything.
++    table = torch.randn((8, 16), dtype=torch.bfloat16)
++    ids = torch.zeros((2,), dtype=torch.int64, device="cuda")
++    with pytest.raises(AssertionError, match="pinned"):
++        host_embedding_gather(ids, table)
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))
+--- a/test/registered/kernels/ops/moe/test_moe_fused_gate.py
++++ b/test/registered/kernels/ops/moe/test_moe_fused_gate.py
+@@ -343,6 +343,23 @@
+     )
+ 
+ 
++@pytest.mark.parametrize("M", [1, 8, 32])
++def test_moe_fused_gate_softmax_none_bias_matches_zero_bias(M: int) -> None:
++    torch.manual_seed(M)
++    scores = torch.randn(M, 256, dtype=torch.float32, device=DEVICE)
++    zero_bias = torch.zeros(256, dtype=torch.float32, device=DEVICE)
++
++    none_w, none_i = moe_fused_gate(
++        scores, None, topk=8, scoring_func="softmax", renormalize=True
++    )
++    zero_w, zero_i = moe_fused_gate(
++        scores, zero_bias, topk=8, scoring_func="softmax", renormalize=True
++    )
++
++    torch.testing.assert_close(none_w, zero_w, rtol=0, atol=0)
++    torch.testing.assert_close(none_i, zero_i, rtol=0, atol=0)
++
++
+ _SIGMOID_AOT_CASES = get_ci_test_range(
+     [
+         (1, 128, 4, True, True, torch.float32),
+--- /dev/null
++++ b/test/registered/unit/layers/quantization/test_fp4_gemm_backend_sm120.py
+@@ -0,0 +1,122 @@
++"""Unit test for the NVFP4 GEMM backend that ``auto`` resolves to on SM120.
++
++FlashInfer ships a dense NVFP4 GEMM built for SM120/SM121 (``mm_fp4`` backend
++``"b12x"``) and prefers it in its own ``"auto"`` order there. SGLang's
++``initialize_fp4_gemm_config`` mapped ``auto`` to ``flashinfer_cutlass`` on
++every non-SM100 Blackwell part, so the faster kernel was never selected and no
++CLI choice could ask for it. These tests pin the resolution table so a later
++edit cannot silently send SM120 back to the CUTLASS kernel, and check that the
++new choice maps to the FlashInfer API name. They mock the device probes so they
++run on CPU CI.
++"""
++
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=3, suite="base-a-test-cpu")
++
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import sglang.srt.layers.quantization.fp4_utils as fp4_utils
++import sglang.srt.model_executor.runner.flashinfer_autotune as autotune
++from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
++from sglang.test.test_utils import CustomTestCase
++
++
++def _resolve(requested, *, capability, is_sm100=False, cuda=True):
++    exec_ns = SimpleNamespace(kernel=SimpleNamespace(fp4_gemm_runner_backend=requested))
++    platform_ns = SimpleNamespace(is_sm100=is_sm100)
++    fp4_utils.FP4_GEMM_RUNNER_BACKEND = None
++    try:
++        with (
++            
++            patch.object(fp4_utils, "is_sm100_supported", return_value=is_sm100),
++            patch.object(fp4_utils, "is_cuda", return_value=cuda),
++            patch.object(fp4_utils, "get_device_capability", return_value=capability),
++        ):
++            fp4_utils.initialize_fp4_gemm_config(SimpleNamespace(fp4_gemm_runner_backend=requested))
++            return fp4_utils.get_fp4_gemm_runner_backend()
++    finally:
++        fp4_utils.FP4_GEMM_RUNNER_BACKEND = None
++
++
++class TestFp4GemmBackendAuto(CustomTestCase):
++    def test_sm120_auto_selects_b12x(self):
++        self.assertEqual(
++            _resolve("auto", capability=(12, 0)), Fp4GemmRunnerBackend.FLASHINFER_B12X
++        )
++
++    def test_sm121_auto_selects_b12x(self):
++        self.assertEqual(
++            _resolve("auto", capability=(12, 1)), Fp4GemmRunnerBackend.FLASHINFER_B12X
++        )
++
++    def test_sm100_auto_keeps_cutedsl(self):
++        self.assertEqual(
++            _resolve("auto", capability=(10, 0), is_sm100=True),
++            Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL,
++        )
++
++    def test_sm90_auto_keeps_marlin(self):
++        self.assertEqual(
++            _resolve("auto", capability=(9, 0)), Fp4GemmRunnerBackend.MARLIN
++        )
++
++    def test_explicit_choice_wins_on_sm120(self):
++        self.assertEqual(
++            _resolve("flashinfer_cutlass", capability=(12, 0)),
++            Fp4GemmRunnerBackend.FLASHINFER_CUTLASS,
++        )
++
++    def test_b12x_maps_to_flashinfer_api_name(self):
++        self.assertEqual(
++            Fp4GemmRunnerBackend.FLASHINFER_B12X.get_flashinfer_backend(), "b12x"
++        )
++
++    def test_b12x_predicate(self):
++        self.assertTrue(Fp4GemmRunnerBackend.FLASHINFER_B12X.is_flashinfer_b12x())
++        self.assertFalse(Fp4GemmRunnerBackend.FLASHINFER_CUTLASS.is_flashinfer_b12x())
++
++
++def _autotune_gate(backend, *, quantization="modelopt_fp4"):
++    """Run ``should_run_flashinfer_autotune`` with only the FP4 GEMM term live.
++
++    The MoE backend is ``triton`` and the model is NVFP4, so the MoE and FP8
++    terms are both False and the result is the FP4 GEMM term alone.
++    """
++    exec_ns = SimpleNamespace(
++        kernel=SimpleNamespace(disable_flashinfer_autotune=False),
++        deterministic=SimpleNamespace(enable_deterministic_inference=False),
++        moe=SimpleNamespace(moe_runner_backend="triton", moe_a2a_backend="none"),
++    )
++    runner = SimpleNamespace(
++        device="cuda",
++        model_config=SimpleNamespace(quantization=quantization),
++        spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
++        is_draft_worker=False,
++    )
++    fp4_utils.FP4_GEMM_RUNNER_BACKEND = backend
++    try:
++        with (
++            patch.object(autotune, "get_exec", return_value=exec_ns),
++            patch("torch.cuda.get_device_capability", return_value=(12, 0)),
++        ):
++            return autotune.should_run_flashinfer_autotune(runner)
++    finally:
++        fp4_utils.FP4_GEMM_RUNNER_BACKEND = None
++
++
++class TestFp4AutotuneGate(CustomTestCase):
++    def test_b12x_keeps_the_fp4_autotune_pass(self):
++        self.assertTrue(_autotune_gate(Fp4GemmRunnerBackend.FLASHINFER_B12X))
++
++    def test_cutlass_still_autotunes(self):
++        self.assertTrue(_autotune_gate(Fp4GemmRunnerBackend.FLASHINFER_CUTLASS))
++
++    def test_marlin_does_not_autotune(self):
++        self.assertFalse(_autotune_gate(Fp4GemmRunnerBackend.MARLIN))
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- /dev/null
++++ b/test/registered/unit/layers/quantization/test_fp8_moe_runner_fallback.py
+@@ -0,0 +1,38 @@
++"""Fp8MoEMethod builds a triton runner when the global MoE runner backend is
++flashinfer_cutlass or flashinfer_cutedsl, which have no fp8 MoE path."""
++
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=5, suite="base-a-test-cpu")
++
++import unittest
++from unittest.mock import patch
++
++import sglang.srt.layers.quantization.fp8 as fp8
++from sglang.srt.layers.moe import MoeRunnerBackend, MoeRunnerConfig
++from sglang.test.test_utils import CustomTestCase
++
++
++class TestFp8MoeRunnerFallback(CustomTestCase):
++    def _runner_backend_for(self, global_backend):
++        method = fp8.Fp8MoEMethod.__new__(fp8.Fp8MoEMethod)
++        with patch.object(fp8, "get_moe_runner_backend", return_value=global_backend):
++            method.create_moe_runner(layer=None, moe_runner_config=MoeRunnerConfig())
++        return method.runner.runner_backend
++
++    def test_flashinfer_cutlass_falls_back_to_triton(self):
++        self.assertTrue(
++            self._runner_backend_for(MoeRunnerBackend.FLASHINFER_CUTLASS).is_triton()
++        )
++
++    def test_flashinfer_cutedsl_falls_back_to_triton(self):
++        self.assertTrue(
++            self._runner_backend_for(MoeRunnerBackend.FLASHINFER_CUTEDSL).is_triton()
++        )
++
++    def test_triton_is_kept(self):
++        self.assertTrue(self._runner_backend_for(MoeRunnerBackend.TRITON).is_triton())
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- a/test/registered/unit/model_loader/test_modelopt_loader.py
++++ b/test/registered/unit/model_loader/test_modelopt_loader.py
+@@ -18,7 +18,12 @@
+ from sglang.srt.layers.linear import ReplicatedLinear
+ from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+ from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+-from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
++from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
++from sglang.srt.layers.quantization.fp8 import (
++    Fp8Config,
++    Fp8LinearMethod,
++    Fp8MoEMethod,
++)
+ from sglang.srt.layers.quantization.modelopt_quant import (
+     ModelOptFp4Config,
+     ModelOptFp4LinearMethod,
+@@ -906,6 +911,44 @@
+             "FP8",
+         )
+ 
++    def test_mixed_precision_resolves_vl_language_model_keys(self):
++        # nvidia/Qwen3.8-Flash-Next-NVFP4 keys the text stack as
++        # `model.language_model.*` while Qwen4-Exp modules are `model.*`.
++        quant_config = ModelOptMixedPrecisionConfig.from_config(
++            {
++                "quant_algo": "MIXED_PRECISION",
++                "quantized_layers": {
++                    "model.language_model.layers.3.mlp.experts": {
++                        "quant_algo": "NVFP4",
++                        "group_size": 16,
++                    },
++                    "model.language_model.layers.1.ple.ple_embedding.ngram_embedding": {
++                        "quant_algo": "FP8"
++                    },
++                    "mtp.layers.0.mlp.experts": {
++                        "quant_algo": "FP8_BLOCK_SCALES",
++                        "group_size": 128,
++                    },
++                },
++            }
++        )
++
++        self.assertEqual(quant_config.exclude_modules, [])
++        self.assertEqual(
++            quant_config.resolve_quant_algo("model.layers.3.mlp.experts"), "NVFP4"
++        )
++        self.assertEqual(
++            quant_config.resolve_quant_algo(
++                "model.layers.1.ple.ple_embedding.ngram_embedding"
++            ),
++            "FP8",
++        )
++        mtp_method = quant_config.get_quant_method(
++            FusedMoE.__new__(FusedMoE), "mtp.layers.0.mlp.experts"
++        )
++        self.assertIsInstance(mtp_method, Fp8MoEMethod)
++        self.assertEqual(mtp_method.quant_config.weight_block_size, [128, 128])
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+--- a/test/registered/unit/models/test_shared_experts_fusion_gates.py
++++ b/test/registered/unit/models/test_shared_experts_fusion_gates.py
+@@ -467,7 +467,20 @@
+         )
+ 
+         # The normalization the constructor applies, shared with the gate.
+-        self.assertIsNone(_mtp_quant_config(_quant("modelopt_mixed")))
++        mixed_bf16_mtp = SimpleNamespace(
++            get_name=lambda: "modelopt_mixed",
++            quantized_layers={"model.layers.0.mlp.experts": {"quant_algo": "NVFP4"}},
++        )
++        self.assertIsNone(_mtp_quant_config(mixed_bf16_mtp))
++        # MIXED_PRECISION checkpoints that quantize the MTP head keep it.
++        mixed_fp8_mtp = SimpleNamespace(
++            get_name=lambda: "modelopt_mixed",
++            quantized_layers={
++                "model.layers.0.mlp.experts": {"quant_algo": "NVFP4"},
++                "mtp.layers.0.mlp.experts": {"quant_algo": "FP8_BLOCK_SCALES"},
++            },
++        )
++        self.assertIs(_mtp_quant_config(mixed_fp8_mtp), mixed_fp8_mtp)
+         serialized = SimpleNamespace(
+             get_name=lambda: "modelopt_fp4", is_checkpoint_nvfp4_serialized=True
+         )
+--- a/test/registered/unit/test_model_overrides.py
++++ b/test/registered/unit/test_model_overrides.py
+@@ -2323,6 +2323,40 @@
+         with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+             self.assertEqual(_qwen3_moe_family_overrides(None, None), {})
+ 
++    def test_qwen3_moe_family_mixed_precision_moe_runner(self):
++        from sglang.srt.arg_groups.overrides import _qwen3_moe_family_overrides
++
++        def _mixed(expert_algo):
++            return SimpleNamespace(
++                architectures=["Qwen4ExpForConditionalGeneration"],
++                quantization_config={
++                    "quant_method": "modelopt_mixed",
++                    "quantized_layers": {
++                        "model.language_model.layers.0.mlp.experts": {
++                            "quant_algo": expert_algo
++                        }
++                    },
++                },
++            )
++
++        args = SimpleNamespace(
++            quantization="modelopt_mixed",
++            _quantization_explicitly_unset=False,
++            moe_a2a_backend="none",
++            moe_runner_backend="auto",
++        )
++        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
++            # W4A4 experts take trtllm-gen like modelopt_fp4; W4A16 has no
++            # trtllm-gen kernel and goes to marlin.
++            self.assertEqual(
++                _qwen3_moe_family_overrides(args, _mixed("NVFP4")),
++                {"moe_runner_backend": "flashinfer_trtllm"},
++            )
++            self.assertEqual(
++                _qwen3_moe_family_overrides(args, _mixed("W4A16_NVFP4")),
++                {"moe_runner_backend": "marlin"},
++            )
++
+     def test_step3p_declarations_at_callable_level(self):
+         from sglang.srt.arg_groups.overrides import _step3p_overrides
+ 

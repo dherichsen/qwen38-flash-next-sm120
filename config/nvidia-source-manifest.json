@@ -1,0 +1,94 @@
+{
+  "python/sglang/kernels/jit/csrc/moe/route_radix.cuh": {
+    "before": "f93a2c03c15bf98203b0412b96aee97422020e4c3d22b55416afb99dd42e0c29",
+    "after": "338a64b33b475ac8df195ac36e5a32ab55fc1e4a46589004ea5c24f4d89f036a"
+  },
+  "python/sglang/kernels/ops/embeddings/__init__.py": {
+    "before": "342660f1c240300f60785a0eba6927dc834c56c40e44ffa8b96103e76e5bfafb",
+    "after": "530ea5bee63955a19b734cf301dabcfe8169727a3ecdb3d080049da52a936321"
+  },
+  "python/sglang/kernels/ops/embeddings/host_embedding_gather.py": {
+    "before": null,
+    "after": "b0f00fdc0b0aaac466eed862c3f9d55735fb54a4876b37758705f9e2d3d43537"
+  },
+  "python/sglang/kernels/ops/moe/moe_fused_gate.py": {
+    "before": "945eae03580d034420a20f2c38adf8d9ae8fed4a13de364d8c235466ffc513b0",
+    "after": "df9a00ec825b3bc254a9468596a7cf756d380ac23dfaee23ead77147d7710d4b"
+  },
+  "python/sglang/srt/arg_groups/overrides.py": {
+    "before": "d3a1ccc96359d544b124ca9d666e161f2de4cdbfa649b8f0239bcdb6fe3f8692",
+    "after": "79e37078bb66cd025e3b6446316b0179c0c4061855fbc33b821267dfce35fe43"
+  },
+  "python/sglang/srt/layers/moe/topk.py": {
+    "before": "8cc479ccfc835899db587194a3b193806135666f4743722da81cf3eb9a413300",
+    "after": "4ac91bee05a7c92aec6f19b89a6779c6f4e31e9ce0727e7bf995d45103de3325"
+  },
+  "python/sglang/srt/layers/quantization/fp4_utils.py": {
+    "before": "2ff0495eb47d8afb282406d7e5306c9c20b5edcb65316435c7f39c3fe064bb32",
+    "after": "e3c2dfa454ff597455b761f7ceba6bef4c5db488b95d1d7f2c51823d3ec998f8"
+  },
+  "python/sglang/srt/layers/quantization/fp8.py": {
+    "before": "d7b55504bd0554863e70e7d053b61d0b235addd2ca3c1d2cbd8ca24a23926c76",
+    "after": "af67596ebbae52b817ea36a2ef8a5c275a5331b633845ab29d76eada009457b3"
+  },
+  "python/sglang/srt/layers/quantization/modelopt_quant.py": {
+    "before": "66749a8bd32307c5d4f59aa7f59c41dc8e3bfddd2da8a3d987b426ed3af52539",
+    "after": "9d4f271f3cda6ba81eb53a0541cf8b6b2b76e9c73a8daacfe8d5a3214b7cded5"
+  },
+  "python/sglang/srt/layers/vocab_parallel_embedding.py": {
+    "before": "c837114a550d4d5b337e3e14847eb0b72896c45a124b57f2364272e8cb4a0113",
+    "after": "5d3ca0b3aa84d10a0ba50bccae2b46d103e1b754bcc365b059b8df926ce13d58"
+  },
+  "python/sglang/srt/model_executor/model_runner.py": {
+    "before": "e57079642bdfff748493c717c363766d9cf6d7b5fb869beb3301e88d39d3659d",
+    "after": "b3d9563560b1f10aeaaa66c35e3d67e459eb95bee09a3c77bf636f4ee74f081e"
+  },
+  "python/sglang/srt/model_executor/model_runner_components/startup_weight_load.py": {
+    "before": "cd502780948edcffc33027a4b324a37da14630468b1c5ed0cd22bf4515bc4efb",
+    "after": "33507650d42ca694fdb6397df1e8377753d988993b3c6890d331db618466d11d"
+  },
+  "python/sglang/srt/model_executor/runner/flashinfer_autotune.py": {
+    "before": "a719df49227f1c16725ee08b3653ce533a231f202f026eb0abf6654b2230a5c4",
+    "after": "edba4649025193fa21e55a9deea070807d8eec4c1cd9c7b81a01770f5adfec54"
+  },
+  "python/sglang/srt/models/qwen3_5_mtp.py": {
+    "before": "263695710ffe8fd80a973e5fcda47fac4bd516a355ec87eaa968430b8ac75953",
+    "after": "533ccf112009f89d0f2631d470e7cdd843dad0df0537fac0735ba68dffb6cfc8"
+  },
+  "python/sglang/srt/models/qwen4_exp.py": {
+    "before": "f406977eb2373937393241f453477867f7dc943bd4839216db8fe66fa9f921d8",
+    "after": "7cf75843f0b0d0a9bb553f56ede4467e99f6580bbe5f0de0910968cc30decee4"
+  },
+  "python/sglang/srt/server_args.py": {
+    "before": "177600230a33a7badf94f49c3dff7d5aae3762f03a1152c8ea62302d188734d8",
+    "after": "7f5ab75ca40fecf36174bfa0a111742ebe437a98f577dee06f66a7472d20bac5"
+  },
+  "test/registered/kernels/ops/embeddings/test_host_embedding_gather.py": {
+    "before": null,
+    "after": "84ad4590cfce2578b1e2b2d46ac634b8020fa0945f1478d9c3e9f196e9ecdde6"
+  },
+  "test/registered/kernels/ops/moe/test_moe_fused_gate.py": {
+    "before": "c8d7b41312d393353e8f029af94688e02cf5d119272cfbfa26ea2f08a199d20f",
+    "after": "1b3e0cf1f19f1966e4352de59ebc7db56343e9b6cea21334f44d11bc2b38d2d8"
+  },
+  "test/registered/unit/layers/quantization/test_fp4_gemm_backend_sm120.py": {
+    "before": null,
+    "after": "7feddf67d9a4a06da640947954ab9e561286617f67a2a2bc6c7251d57309643f"
+  },
+  "test/registered/unit/layers/quantization/test_fp8_moe_runner_fallback.py": {
+    "before": null,
+    "after": "2c93f90afaf7b0857753dbd29b4c1122962b7a1316e43962bd1d9370b55ef3ce"
+  },
+  "test/registered/unit/model_loader/test_modelopt_loader.py": {
+    "before": "3aa2511f045b43207204ba10aff194b72f4e2e96019e404783a29d871b178b27",
+    "after": "fe06b48c2b1eb25c2ab5afe34da9b2c8768b7bbb57e63bee15ed7f9e805807c6"
+  },
+  "test/registered/unit/models/test_shared_experts_fusion_gates.py": {
+    "before": "f2e71828f5e319a1f184975b77e651bb21b023f8eabe7268936d25f579157852",
+    "after": "bfc9b2f9a0e5fdaf01a7eab7aaf2064a6df567b867a22b7ebde75b501fe2c3a1"
+  },
+  "test/registered/unit/test_model_overrides.py": {
+    "before": "7312dc520f93075c026c824f420ef540b8d3727d1702166d47080f2e5a261228",
+    "after": "6608dfedb7cd6e3e3c2ffac34ded4e688396050759ea46baff58fe6331f14d1e"
+  }
+}
